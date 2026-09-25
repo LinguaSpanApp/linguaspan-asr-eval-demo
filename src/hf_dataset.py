@@ -17,6 +17,23 @@ TEXT_COLUMN_CANDIDATES = [
 ]
 
 
+def _patch_legacy_cache_check() -> None:
+    """datasets.DatasetBuilder._check_legacy_cache2 dill-hashes config.data_files
+    purely to look for a pre-3.0 cache directory layout -- optional, and on some
+    Python builds (seen on Streamlit Cloud's Python 3.14) the dill pickling
+    inside it raises a TypeError unrelated to anything about the actual
+    dataset. We never rely on an old-format cache dir, so skipping this
+    check entirely is safe regardless of Python version."""
+    try:
+        from datasets.builder import DatasetBuilder
+        DatasetBuilder._check_legacy_cache2 = lambda self, dataset_module: None
+    except Exception:
+        pass
+
+
+_patch_legacy_cache_check()
+
+
 def parse_hf_repo_id(url_or_id: str, repo_type: str = "dataset") -> str:
     """Accepts a bare 'org/name' or a full huggingface.co URL (with optional
     /tree/main, /blob/main/..., etc. suffix) and returns 'org/name'."""
