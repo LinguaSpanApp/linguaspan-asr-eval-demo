@@ -1,0 +1,10 @@
+.env
+.streamlit/secrets.toml
+__pycache__/
+*.pyc
+data/*
+!data/.gitkeep
+reports/*
+!reports/.gitkeep
+*.pdf
+.DS_Store

@@ -1,0 +1,8 @@
+pandas>=2.0
+requests>=2.30
+jiwer>=4.0
+huggingface_hub>=1.0
+modal>=1.2
+datasets>=4.0
+soundfile>=0.13
+streamlit>=1.50
