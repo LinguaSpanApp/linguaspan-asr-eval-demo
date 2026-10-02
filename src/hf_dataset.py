@@ -16,6 +16,27 @@ TEXT_COLUMN_CANDIDATES = [
     "text", "transcription", "transcript", "sentence", "reference", "reference_text", "label",
 ]
 
+# Some older dataset repos (e.g. intronhealth/afrispeech-200) still ship a
+# pre-3.0 "loading script" (a .py file) instead of plain Parquet. The
+# `datasets` library refuses to execute those for security reasons and
+# raises this exact RuntimeError. Hugging Face auto-converts every such
+# dataset to Parquet on a hidden branch, which we fall back to.
+LEGACY_SCRIPT_ERROR_MARKER = "Dataset scripts are no longer supported"
+PARQUET_FALLBACK_REVISION = "refs/convert/parquet"
+
+
+def _call_with_parquet_fallback(fn, *args, **kwargs):
+    """Call fn(*args, **kwargs); if it fails because the repo still uses a
+    legacy loading script, retry once against the auto-converted Parquet
+    mirror. Returns (result, revision_used) -- revision_used is None for the
+    normal path, or PARQUET_FALLBACK_REVISION if the fallback fired."""
+    try:
+        return fn(*args, **kwargs), None
+    except RuntimeError as exc:
+        if LEGACY_SCRIPT_ERROR_MARKER not in str(exc):
+            raise
+        return fn(*args, revision=PARQUET_FALLBACK_REVISION, **kwargs), PARQUET_FALLBACK_REVISION
+
 
 def _patch_legacy_cache_check() -> None:
     """datasets.DatasetBuilder._check_legacy_cache2 dill-hashes config.data_files
@@ -53,11 +74,11 @@ def list_configs_and_splits(repo_id: str) -> dict[str, list[str]]:
     from datasets import get_dataset_config_names, get_dataset_split_names
 
     token = os.environ.get("HF_TOKEN")
-    configs = get_dataset_config_names(repo_id, token=token)
+    configs, revision = _call_with_parquet_fallback(get_dataset_config_names, repo_id, token=token)
     result = {}
     for config in configs:
         try:
-            result[config] = get_dataset_split_names(repo_id, config_name=config, token=token)
+            result[config] = get_dataset_split_names(repo_id, config_name=config, token=token, revision=revision)
         except Exception:
             result[config] = ["train"]
     return result
@@ -102,7 +123,9 @@ def sample_dataset(
     from datasets import Audio, load_dataset
 
     token = os.environ.get("HF_TOKEN")
-    ds = load_dataset(repo_id, name=config, split=split, streaming=True, token=token)
+    ds, _revision = _call_with_parquet_fallback(
+        load_dataset, repo_id, name=config, split=split, streaming=True, token=token,
+    )
     audio_col, text_col = _detect_columns(ds.features)
     metadata_cols = [c for c in ds.features if c not in (audio_col, text_col)]
 
@@ -137,8 +160,10 @@ def sample_dataset(
                 row[col] = value
         rows.append(row)
 
+    non_empty_references = sum(1 for r in rows if str(r.get("reference_text") or "").strip())
     info = {
         "repo_id": repo_id, "config": config, "split": split,
         "audio_col": audio_col, "text_col": text_col, "audio_dir": audio_dir,
+        "sampled_count": len(rows), "non_empty_reference_count": non_empty_references,
     }
     return pd.DataFrame(rows), info

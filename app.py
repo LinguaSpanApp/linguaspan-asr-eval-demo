@@ -210,6 +210,20 @@ if run_clicked:
         df, info = sample_dataset(dataset_repo, n=int(sample_size), config=config_name, split=split_name)
         st.write(f"Sampled {len(df)} rows. audio column: `{info['audio_col']}`, reference column: `{info['text_col']}`")
 
+        non_empty = info.get("non_empty_reference_count", 0)
+        sampled_count = info.get("sampled_count", len(df))
+        if sampled_count and non_empty == 0:
+            st.warning(
+                f"Every sampled row has a blank `{info['text_col']}` value for split `{split_name}` -- "
+                "this split likely has its ground truth withheld (common for `test`/benchmark splits). "
+                "WER/CER from this run will be meaningless. Try the `train` split instead."
+            )
+        elif sampled_count and non_empty < sampled_count:
+            st.warning(
+                f"{sampled_count - non_empty} of {sampled_count} sampled rows have a blank "
+                f"`{info['text_col']}` value -- WER/CER for those rows will be meaningless."
+            )
+
         schema = detect_schema(df)
         client = GenericModalASRClient(model_repo)
 
