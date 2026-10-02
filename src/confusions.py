@@ -82,3 +82,39 @@ def build_confusion_tables(df: pd.DataFrame, top_n: int = 50) -> dict[str, pd.Da
         "deletions": deletions_df,
         "insertions": insertions_df,
     }
+
+
+def build_confusion_index(df: pd.DataFrame) -> dict[tuple[str, str, str], list]:
+    """Maps (error_type, reference_word, hypothesis_word) -> row_ids where that
+    exact confusion occurred (the unused side of ref/hyp is "" -- a deletion
+    has no hypothesis_word, an insertion has no reference_word).
+
+    This is the reverse lookup the Streamlit UI needs for error-pattern drill
+    down: given "ni -> ni with tone mark" is a frequent substitution, find the
+    actual audio samples where it happened so a language specialist can listen
+    and judge root cause (noise, weak audio, genuine model error, ...)."""
+    required = {"wer", "reference_text", "hypothesis_text", "row_id"}
+    if not required.issubset(df.columns):
+        return {}
+
+    scored = df.dropna(subset=["wer", "reference_text", "hypothesis_text"])
+    index: dict[tuple[str, str, str], list] = {}
+
+    for _, row in scored.iterrows():
+        row_id = row["row_id"]
+        subs, dels, ins = _row_confusions(str(row["reference_text"]), str(row["hypothesis_text"]))
+
+        for ref, hyp in set(subs):
+            index.setdefault(("substitution", ref, hyp), [])
+            if row_id not in index[("substitution", ref, hyp)]:
+                index[("substitution", ref, hyp)].append(row_id)
+        for word in set(dels):
+            index.setdefault(("deletion", word, ""), [])
+            if row_id not in index[("deletion", word, "")]:
+                index[("deletion", word, "")].append(row_id)
+        for word in set(ins):
+            index.setdefault(("insertion", "", word), [])
+            if row_id not in index[("insertion", "", word)]:
+                index[("insertion", "", word)].append(row_id)
+
+    return index

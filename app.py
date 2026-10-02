@@ -10,6 +10,7 @@ GenericASR, which loads whatever model repo you type in at call time).
 """
 from __future__ import annotations
 
+import json
 import os
 
 import pandas as pd
@@ -37,6 +38,93 @@ from src.generic_modal_client import GenericModalASRClient  # noqa: E402
 from src.hf_dataset import list_configs_and_splits, parse_hf_repo_id, sample_dataset  # noqa: E402
 
 st.set_page_config(page_title="Linguaspan ASR Eval", layout="wide")
+
+SAMPLE_META_COLUMNS = ("language", "speaker_id", "gender", "age_range", "model_choice", "wer", "cer")
+MAX_DRILLDOWN_SAMPLES = 25
+
+
+def _download_csv_button(df: pd.DataFrame, filename: str, label: str, key: str) -> None:
+    if df is None or df.empty:
+        return
+    st.download_button(label, df.to_csv(index=False).encode("utf-8"), file_name=filename, mime="text/csv", key=key)
+
+
+def _sample_label(row: pd.Series) -> str:
+    text = row.get("reference_text")
+    if pd.isna(text) or not text:
+        text = row.get("hypothesis_text") or row.get("audio_ref", "")
+    text = str(text)
+    if len(text) > 60:
+        text = text[:57] + "..."
+    wer = row.get("wer")
+    wer_part = f" (wer={wer:.2f})" if pd.notna(wer) else ""
+    return f"{row['row_id']}: {text}{wer_part}"
+
+
+def _render_sample(row: pd.Series) -> None:
+    """One sample's detail + audio player -- used both for free browsing of
+    the per-sample table and for confusion drill-down results."""
+    cols = st.columns([3, 2])
+    with cols[0]:
+        if pd.notna(row.get("reference_text")):
+            st.markdown(f"**Reference:** {row['reference_text']}")
+        st.markdown(f"**Hypothesis:** {row.get('hypothesis_text', '')}")
+        meta_bits = [
+            f"{col}: {row[col]}" for col in SAMPLE_META_COLUMNS
+            if col in row.index and pd.notna(row[col])
+        ]
+        if meta_bits:
+            st.caption(" · ".join(meta_bits))
+    with cols[1]:
+        audio_ref = row.get("audio_ref")
+        if audio_ref and (str(audio_ref).startswith("http") or os.path.exists(str(audio_ref))):
+            st.audio(str(audio_ref))
+        else:
+            st.caption("Audio not available (local temp file may be gone, e.g. after a server restart).")
+    st.divider()
+
+
+def _confusion_options(table_df: pd.DataFrame, error_type: str) -> dict[str, tuple]:
+    options: dict[str, tuple] = {}
+    for _, r in table_df.iterrows():
+        if error_type == "substitution":
+            label = f"{r['reference_word']} → {r['hypothesis_word']}  ({r['count']}x)"
+            key = ("substitution", r["reference_word"], r["hypothesis_word"])
+        elif error_type == "deletion":
+            label = f"\"{r['word']}\" deleted  ({r['count']}x)"
+            key = ("deletion", r["word"], "")
+        else:
+            label = f"\"{r['word']}\" inserted  ({r['count']}x)"
+            key = ("insertion", "", r["word"])
+        options[label] = key
+    return options
+
+
+def _render_confusion_drilldown(
+    table_df: pd.DataFrame, error_type: str, index: dict, results_df: pd.DataFrame,
+) -> None:
+    if table_df.empty:
+        st.caption("No confusions of this type to drill into.")
+        return
+
+    options = _confusion_options(table_df, error_type)
+    choice = st.selectbox(
+        "Find audio samples where this happened:", options=list(options.keys()), key=f"drilldown_{error_type}",
+    )
+    if not choice:
+        return
+
+    row_ids = index.get(options[choice], [])
+    if not row_ids:
+        st.info("No matching samples found.")
+        return
+
+    matched = results_df[results_df["row_id"].isin(row_ids)]
+    st.caption(f"{len(matched)} sample(s) contain this confusion:")
+    for _, row in matched.head(MAX_DRILLDOWN_SAMPLES).iterrows():
+        _render_sample(row)
+    if len(matched) > MAX_DRILLDOWN_SAMPLES:
+        st.caption(f"...and {len(matched) - MAX_DRILLDOWN_SAMPLES} more (showing first {MAX_DRILLDOWN_SAMPLES}).")
 
 
 def _expected_password() -> str | None:
@@ -154,6 +242,10 @@ if "results" in st.session_state:
     cer = summary.get("mean_cer")
     cols[3].metric("Mean CER", f"{cer:.3f}" if cer is not None else "n/a")
     cols[4].metric("API errors", summary.get("api_errors", 0))
+    st.download_button(
+        "Download summary.json", json.dumps(summary, indent=2, default=str).encode("utf-8"),
+        file_name="summary.json", mime="application/json", key="dl_summary",
+    )
 
     st.subheader("Coverage gaps")
     gaps = report.coverage_gaps(results, metadata_cols, min_samples=threshold)
@@ -162,6 +254,7 @@ if "results" in st.session_state:
     else:
         st.warning(f"{len(gaps)} slice value(s) below the {threshold}-sample coverage threshold:")
         st.dataframe(gaps, use_container_width=True)
+        _download_csv_button(gaps, "coverage_gaps.csv", "Download coverage_gaps.csv", key="dl_gaps")
 
     st.subheader("Slice breakdowns")
     slices = report.slice_reports(results, metadata_cols)
@@ -170,23 +263,39 @@ if "results" in st.session_state:
         for tab, (name, slice_df) in zip(tabs, slices.items()):
             with tab:
                 st.dataframe(slice_df, use_container_width=True)
+                _download_csv_button(slice_df, f"slice_{name}.csv", f"Download slice_{name}.csv", key=f"dl_slice_{name}")
     else:
         st.info("No metadata columns to slice by.")
 
     st.subheader("Word confusions")
+    st.caption("Pick a confusion below to pull up the actual audio samples it happened in.")
     tables = confusions.build_confusion_tables(results)
+    confusion_index = confusions.build_confusion_index(results)
     tab_sub, tab_del, tab_ins = st.tabs(["Substitutions", "Deletions", "Insertions"])
     with tab_sub:
-        st.dataframe(tables.get("substitutions", pd.DataFrame()), use_container_width=True)
+        sub_table = tables.get("substitutions", pd.DataFrame())
+        st.dataframe(sub_table, use_container_width=True)
+        _download_csv_button(sub_table, "confusions_substitutions.csv", "Download substitutions.csv", key="dl_sub")
+        _render_confusion_drilldown(sub_table, "substitution", confusion_index, results)
     with tab_del:
-        st.dataframe(tables.get("deletions", pd.DataFrame()), use_container_width=True)
+        del_table = tables.get("deletions", pd.DataFrame())
+        st.dataframe(del_table, use_container_width=True)
+        _download_csv_button(del_table, "confusions_deletions.csv", "Download deletions.csv", key="dl_del")
+        _render_confusion_drilldown(del_table, "deletion", confusion_index, results)
     with tab_ins:
-        st.dataframe(tables.get("insertions", pd.DataFrame()), use_container_width=True)
+        ins_table = tables.get("insertions", pd.DataFrame())
+        st.dataframe(ins_table, use_container_width=True)
+        _download_csv_button(ins_table, "confusions_insertions.csv", "Download insertions.csv", key="dl_ins")
+        _render_confusion_drilldown(ins_table, "insertion", confusion_index, results)
 
     st.subheader("Per-sample results")
     st.dataframe(results, use_container_width=True)
+    _download_csv_button(results, "results.csv", "Download results.csv", key="dl_results")
 
-    st.download_button(
-        "Download results.csv", results.to_csv(index=False).encode("utf-8"),
-        file_name="results.csv", mime="text/csv",
-    )
+    if "audio_ref" in results.columns:
+        st.subheader("Listen to a sample")
+        options = {_sample_label(row): row["row_id"] for _, row in results.iterrows()}
+        picked_label = st.selectbox("Pick a sample to review:", options=list(options.keys()), key="sample_picker")
+        if picked_label:
+            picked_row = results[results["row_id"] == options[picked_label]].iloc[0]
+            _render_sample(picked_row)
