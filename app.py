@@ -10,8 +10,10 @@ GenericASR, which loads whatever model repo you type in at call time).
 """
 from __future__ import annotations
 
+import io
 import json
 import os
+import zipfile
 
 import pandas as pd
 import streamlit as st
@@ -47,6 +49,34 @@ def _download_csv_button(df: pd.DataFrame, filename: str, label: str, key: str) 
     if df is None or df.empty:
         return
     st.download_button(label, df.to_csv(index=False).encode("utf-8"), file_name=filename, mime="text/csv", key=key)
+
+
+def _build_results_zip(results_df: pd.DataFrame, metadata_cols: list[str], min_slice_samples: int) -> bytes:
+    """Bundles every table shown on the page into one zip. Grab this the
+    moment a run finishes -- a hosted Streamlit session that sits idle for a
+    while can silently disconnect, and everything held in st.session_state
+    (the whole results DataFrame) is lost on reconnect. One download covers
+    you instead of needing several separate clicks, any one of which could
+    be the click that reveals the dead session."""
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        summary = report.aggregate_summary(results_df)
+        zf.writestr("summary.json", json.dumps(summary, indent=2, default=str))
+        zf.writestr("results.csv", results_df.to_csv(index=False))
+
+        gaps = report.coverage_gaps(results_df, metadata_cols, min_samples=min_slice_samples)
+        if not gaps.empty:
+            zf.writestr("coverage_gaps.csv", gaps.to_csv(index=False))
+
+        for name, slice_df in report.slice_reports(results_df, metadata_cols).items():
+            if not slice_df.empty:
+                zf.writestr(f"slice_{name}.csv", slice_df.to_csv(index=False))
+
+        for name, table in confusions.build_confusion_tables(results_df).items():
+            if not table.empty:
+                zf.writestr(f"confusions_{name}.csv", table.to_csv(index=False))
+
+    return buf.getvalue()
 
 
 def _sample_label(row: pd.Series) -> str:
@@ -246,6 +276,16 @@ if "results" in st.session_state:
     threshold: int = st.session_state["min_slice_samples"]
 
     st.header(f"Results: {st.session_state['model_repo']} on {st.session_state['dataset_repo']}")
+
+    st.download_button(
+        "\U0001f4e6 Download everything (.zip)",
+        _build_results_zip(results, metadata_cols, threshold),
+        file_name="evaluation_report.zip", mime="application/zip", key="dl_all_zip", type="primary",
+    )
+    st.caption(
+        "Grab this as soon as a run finishes. A hosted session left idle for a while can silently "
+        "disconnect -- results live only in memory until downloaded, and a dead session loses them."
+    )
 
     summary = report.aggregate_summary(results)
     cols = st.columns(5)
