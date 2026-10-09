@@ -10,10 +10,13 @@ GenericASR, which loads whatever model repo you type in at call time).
 """
 from __future__ import annotations
 
+import glob
 import io
 import json
 import os
+import shutil
 import zipfile
+from datetime import datetime
 
 import pandas as pd
 import streamlit as st
@@ -77,6 +80,107 @@ def _build_results_zip(results_df: pd.DataFrame, metadata_cols: list[str], min_s
                 zf.writestr(f"confusions_{name}.csv", table.to_csv(index=False))
 
     return buf.getvalue()
+
+
+SAVED_RUNS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "saved_runs")
+MAX_SAVED_RUNS = 5  # each run copies its audio to disk too -- keep this modest on a free-tier container
+
+
+def _safe_slug(text: str, maxlen: int = 40) -> str:
+    slug = "".join(c if c.isalnum() else "-" for c in text)
+    slug = "-".join(filter(None, slug.split("-")))
+    return slug[:maxlen] or "run"
+
+
+def _prune_old_runs(keep: int = MAX_SAVED_RUNS) -> None:
+    if not os.path.isdir(SAVED_RUNS_DIR):
+        return
+    run_dirs = sorted(
+        (d for d in glob.glob(os.path.join(SAVED_RUNS_DIR, "*")) if os.path.isdir(d)), reverse=True,
+    )  # newest first -- names are timestamp-prefixed
+    for old_dir in run_dirs[keep:]:
+        shutil.rmtree(old_dir, ignore_errors=True)
+
+
+def _save_run(
+    results: pd.DataFrame, metadata_cols: list[str], min_slice_samples: int, model_repo: str, dataset_repo: str,
+) -> str:
+    """Persists a completed run to local disk (results + copied audio files +
+    metadata) the moment it finishes. A dropped Streamlit session (idle
+    WebSocket disconnect, browser refresh) loses st.session_state, but this
+    survives on the server's disk -- reload it from the 'Previous runs'
+    picker instead of re-running the whole evaluation. Does NOT survive a
+    full container restart/redeploy (that wipes local disk too)."""
+    os.makedirs(SAVED_RUNS_DIR, exist_ok=True)
+    run_id = f"{datetime.now().strftime('%Y%m%d-%H%M%S')}_{_safe_slug(model_repo)}_{_safe_slug(dataset_repo)}"
+    run_dir = os.path.join(SAVED_RUNS_DIR, run_id)
+    audio_dir = os.path.join(run_dir, "audio")
+    os.makedirs(audio_dir, exist_ok=True)
+
+    saved = results.copy()
+    if "audio_ref" in saved.columns:
+        new_refs = []
+        for i, ref in enumerate(saved["audio_ref"]):
+            ref = str(ref) if pd.notna(ref) else ""
+            if not ref:
+                new_refs.append("")
+            elif ref.startswith("http"):
+                new_refs.append(ref)  # URL-based audio doesn't need copying
+            elif os.path.exists(ref):
+                ext = os.path.splitext(ref)[1] or ".wav"
+                dest_name = f"{i:04d}{ext}"
+                shutil.copyfile(ref, os.path.join(audio_dir, dest_name))
+                new_refs.append(os.path.join("audio", dest_name))
+            else:
+                new_refs.append("")
+        saved["audio_ref"] = new_refs
+
+    saved.to_csv(os.path.join(run_dir, "results.csv"), index=False)
+    meta = {
+        "model_repo": model_repo, "dataset_repo": dataset_repo, "metadata_cols": metadata_cols,
+        "min_slice_samples": int(min_slice_samples), "created_at": datetime.now().isoformat(timespec="seconds"),
+    }
+    with open(os.path.join(run_dir, "meta.json"), "w") as f:
+        json.dump(meta, f, indent=2)
+
+    _prune_old_runs()
+    return run_dir
+
+
+def _list_saved_runs() -> list[tuple[str, str]]:
+    """[(label, run_dir), ...] newest first."""
+    if not os.path.isdir(SAVED_RUNS_DIR):
+        return []
+    out = []
+    for d in sorted(glob.glob(os.path.join(SAVED_RUNS_DIR, "*")), reverse=True):
+        meta_path = os.path.join(d, "meta.json")
+        if not os.path.isdir(d) or not os.path.exists(meta_path):
+            continue
+        with open(meta_path) as f:
+            meta = json.load(f)
+        label = f"{meta.get('created_at', '?')} — {meta.get('model_repo', '?')} on {meta.get('dataset_repo', '?')}"
+        out.append((label, d))
+    return out
+
+
+def _load_run(run_dir: str) -> None:
+    """Loads a previously saved run back into session_state, resolving
+    audio_ref paths relative to that run's own folder."""
+    results = pd.read_csv(os.path.join(run_dir, "results.csv"))
+    if "audio_ref" in results.columns:
+        def _resolve(ref):
+            ref = str(ref) if pd.notna(ref) else ""
+            return ref if (not ref or ref.startswith("http")) else os.path.join(run_dir, ref)
+        results["audio_ref"] = results["audio_ref"].apply(_resolve)
+
+    with open(os.path.join(run_dir, "meta.json")) as f:
+        meta = json.load(f)
+
+    st.session_state["results"] = results
+    st.session_state["metadata_cols"] = meta["metadata_cols"]
+    st.session_state["min_slice_samples"] = meta["min_slice_samples"]
+    st.session_state["model_repo"] = meta["model_repo"]
+    st.session_state["dataset_repo"] = meta["dataset_repo"]
 
 
 def _sample_label(row: pd.Series) -> str:
@@ -193,6 +297,28 @@ if not _require_password():
 st.title("ASR Model Evaluation")
 st.caption("Point at any Hugging Face model + dataset, run a batch evaluation via Modal, and review the report below.")
 
+# Periodic re-render keeps a little traffic flowing on the WebSocket, which
+# reduces (does not eliminate) idle-disconnects on hosted Streamlit -- the
+# "Previous runs" picker below is what actually protects you when one happens.
+if hasattr(st, "fragment"):
+    @st.fragment(run_every=45)
+    def _heartbeat():
+        st.caption(f"Session active · last check-in {datetime.now().strftime('%H:%M:%S')}")
+    _heartbeat()
+
+with st.sidebar:
+    st.subheader("Previous runs")
+    st.caption("Completed evaluations are auto-saved here -- reload one if your session drops.")
+    saved_runs = _list_saved_runs()
+    if saved_runs:
+        labels = [label for label, _ in saved_runs]
+        picked_label = st.selectbox("Reload a past run:", options=labels, key="saved_run_picker")
+        if st.button("Load this run"):
+            _load_run(dict(saved_runs)[picked_label])
+            st.rerun()
+    else:
+        st.caption("None yet.")
+
 col1, col2 = st.columns(2)
 with col1:
     model_input = st.text_input(
@@ -269,6 +395,9 @@ if run_clicked:
     st.session_state["min_slice_samples"] = int(min_slice_samples)
     st.session_state["model_repo"] = model_repo
     st.session_state["dataset_repo"] = dataset_repo
+
+    saved_dir = _save_run(results, schema.metadata_cols, int(min_slice_samples), model_repo, dataset_repo)
+    st.toast(f"Auto-saved to disk: {os.path.basename(saved_dir)}", icon="\U0001f4be")
 
 if "results" in st.session_state:
     results: pd.DataFrame = st.session_state["results"]
