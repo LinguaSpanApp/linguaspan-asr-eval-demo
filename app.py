@@ -41,6 +41,7 @@ from src.dataset import detect_schema  # noqa: E402
 from src.evaluate import run_evaluation  # noqa: E402
 from src.generic_modal_client import GenericModalASRClient  # noqa: E402
 from src.hf_dataset import list_configs_and_splits, parse_hf_repo_id, sample_dataset  # noqa: E402
+from src import llm_correction  # noqa: E402
 
 st.set_page_config(page_title="Linguaspan ASR Eval", layout="wide")
 
@@ -203,6 +204,11 @@ def _render_sample(row: pd.Series) -> None:
         if pd.notna(row.get("reference_text")):
             st.markdown(f"**Reference:** {row['reference_text']}")
         st.markdown(f"**Hypothesis:** {row.get('hypothesis_text', '')}")
+        if "corrected_text" in row.index and pd.notna(row.get("corrected_text")):
+            flagged = " ⚠️ flagged corrupted, reverted to original" if row.get("llm_flagged_corrupted") else ""
+            st.markdown(f"**🧪 LLM-corrected:** {row['corrected_text']}{flagged}")
+            if pd.notna(row.get("wer_corrected")):
+                st.caption(f"wer: {row.get('wer'):.2f} → {row['wer_corrected']:.2f}")
         meta_bits = [
             f"{col}: {row[col]}" for col in SAMPLE_META_COLUMNS
             if col in row.index and pd.notna(row[col])
@@ -351,6 +357,31 @@ min_slice_samples = st.number_input(
     "Coverage-gap threshold (min samples per slice)", min_value=1, max_value=500, value=max(5, sample_size // 6),
 )
 
+st.divider()
+_ollama_up = llm_correction.ollama_available()
+apply_llm_correction = st.checkbox(
+    "🧪 Apply LLM correction layer (experimental, local-only)",
+    value=False, disabled=not _ollama_up,
+    help="Feeds each sample's raw ASR output (text only, no audio) through a local LLM "
+         "(Ollama + qwen2.5:3b-instruct) that tries to fix likely transcription errors, then "
+         "scores the corrected version too so you can compare. Only works when Ollama is running "
+         "on this machine -- unavailable on the hosted Streamlit Cloud demo.",
+)
+if not _ollama_up:
+    st.caption(
+        "⚠️ Ollama not detected at localhost:11434 with qwen2.5:3b-instruct pulled -- "
+        "this option is unavailable here. Run `ollama serve` and `ollama pull qwen2.5:3b-instruct` locally to enable it."
+    )
+elif apply_llm_correction:
+    correction_language = st.selectbox(
+        "Known-issues hint language", options=["english", "yoruba", "none"], index=0,
+        help="Which known-error hints to include in the correction prompt. Validated so far on "
+             "English (punctuation-as-words, clinical shorthand); Yoruba hints are untested and "
+             "lower-confidence since general LLMs have much less Yoruba training data.",
+    )
+else:
+    correction_language = "english"
+
 run_clicked = st.button("Evaluate", type="primary")
 
 if run_clicked:
@@ -388,6 +419,19 @@ if run_clicked:
         # GenericModalASRClient always calls the one model_repo given, ignoring model_choice,
         # so "comparing" would just call the same model twice per row for nothing.
         results = run_evaluation(df, schema, client, concurrency=4, default_params={}, compare_yoruba_models=False)
+
+        if apply_llm_correction and _ollama_up:
+            st.write(f"Running LLM correction layer on {len(results)} samples (local, qwen2.5:3b-instruct)...")
+            progress = st.progress(0.0)
+            lang_hint = None if correction_language == "none" else correction_language
+            results = llm_correction.correct_dataframe(
+                results, language=lang_hint, concurrency=2,
+                progress_callback=lambda done, total: progress.progress(done / total),
+            )
+            n_flagged = int(results["llm_flagged_corrupted"].sum())
+            if n_flagged:
+                st.warning(f"{n_flagged} correction(s) were flagged as corrupted/leaked and fell back to the original text.")
+
         status.update(label="Evaluation complete", state="complete")
 
     st.session_state["results"] = results
@@ -429,6 +473,22 @@ if "results" in st.session_state:
         "Download summary.json", json.dumps(summary, indent=2, default=str).encode("utf-8"),
         file_name="summary.json", mime="application/json", key="dl_summary",
     )
+
+    if "wer_corrected" in results.columns:
+        st.caption("🧪 LLM correction layer was applied -- comparing against the raw ASR output above:")
+        scored = results.dropna(subset=["wer_corrected", "wer"])
+        ccols = st.columns(3)
+        mean_wer_raw = scored["wer"].mean() if not scored.empty else None
+        mean_wer_corr = scored["wer_corrected"].mean() if not scored.empty else None
+        mean_cer_raw = scored["cer"].mean() if not scored.empty else None
+        mean_cer_corr = scored["cer_corrected"].mean() if not scored.empty else None
+        if mean_wer_raw is not None:
+            ccols[0].metric("Mean WER (corrected)", f"{mean_wer_corr:.3f}",
+                             delta=f"{mean_wer_corr - mean_wer_raw:+.3f}", delta_color="inverse")
+            ccols[1].metric("Mean CER (corrected)", f"{mean_cer_corr:.3f}",
+                             delta=f"{mean_cer_corr - mean_cer_raw:+.3f}", delta_color="inverse")
+        n_flagged = int(results["llm_flagged_corrupted"].sum())
+        ccols[2].metric("Flagged corrupted", n_flagged)
 
     st.subheader("Coverage gaps")
     gaps = report.coverage_gaps(results, metadata_cols, min_samples=threshold)
